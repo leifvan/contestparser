@@ -1,5 +1,7 @@
-from typing import Any, Iterable, Callable, Generator, List, NamedTuple
-from functools import partial
+from typing import Any, Iterable, Callable, Generator, NamedTuple, List, get_args, get_origin
+from typing import get_type_hints
+from inspect import signature, Parameter
+from collections import OrderedDict
 
 
 class Node:
@@ -13,22 +15,22 @@ class Node:
             raise Exception("Can't iterate over a leaf.")
         return self.value[item]
 
-    def leaves(self) -> Generator:
-        if self.is_leaf:
-            yield self
-        else:
-            for node in self:
-                yield from node.leaves()
+    # def leaves(self) -> Generator:
+    #     if self.is_leaf:
+    #         yield self
+    #     else:
+    #         for node in self:
+    #             yield from node.leaves()
 
-    def lowest_nodes(self) -> Generator:
-        if self.is_leaf:
-            raise Exception("Tree only consists of one node.")
-        else:
-            if self[0].is_leaf:  # this assumes that the tree is structurally homogeneous
-                yield self
-            else:
-                for tree in self:
-                    yield from tree.lowest_nodes()
+    # def lowest_nodes(self) -> Generator:
+    #     if self.is_leaf:
+    #         raise Exception("Tree only consists of one node.")
+    #     else:
+    #         if self[0].is_leaf:  # this assumes that the tree is structurally homogeneous
+    #             yield self
+    #         else:
+    #             for tree in self:
+    #                 yield from tree.lowest_nodes()
 
 
 def _expand_op(leaves, func):
@@ -155,6 +157,14 @@ class TreeParser:
         """
         yield from (leaf.value for leaf in self.last_operation)
 
+    def lowest_inner_nodes(self) -> Generator:
+        """
+        Returns a generator over all children of lowest nodes, packed into a list. Equivalent to
+        reduce(list) and calling leaves().
+        """
+        self.reduce(list)
+        yield from self.leaves()
+
     def split(self, separator: str) -> 'TreeParser':
         """
         A convenience method that calls ``split(separator)`` of the values of all leaves and
@@ -175,39 +185,142 @@ class TreeParser:
         return cls(*line_generator())
 
 
-class ContestParser:
-    def __init__(self):
-        ...
+def get_num_args(fn, list_lengths):
+    num = 0
+    length_idx = 0
+
+    for p in signature(fn).parameters.values():
+        if p.kind in (Parameter.KEYWORD_ONLY, Parameter.VAR_KEYWORD):
+            raise Exception("Can't handle keyword-only parameters.")
+        elif p.kind is Parameter.VAR_POSITIONAL:
+            raise Exception("Can't handle variable number of positional parameters.")
+
+        if p.annotation is List:
+            num += list_lengths[length_idx]
+            length_idx += 1
+        else:
+            num += 1
+
+    if length_idx < len(list_lengths):
+        raise Exception("Number of items in 'list_lengths' does not match number of List-annotated "
+                        "parameters in 'fn'.")
+
+    return num
+
+
+class LinearParser:
+    def __init__(self, tree: TreeParser):
+        self.tree = tree
+        self.num_items_since_last_node = -1
+        self.items_iterator = iter(self._get_items_iterator())
+
+    def _get_items_iterator(self):
+        for line in self.tree.lowest_inner_nodes():
+            self.num_items_since_last_node = 0
+            for item in line:
+                yield item
+                self.num_items_since_last_node += 1
+
+    def _get_one(self):
+        return next(self.items_iterator)
+
+    def _get_n(self, n):
+        return [self._get_one() for _ in range(n)]
+
+    def assert_linebreak(self):
+        assert self.num_items_since_last_node == 0
+
+    def parse(self, parse_fn):
+        if parse_fn in (str, int, float):
+            return parse_fn(self._get_one())
+        elif parse_fn is list:
+            raise Exception("To declare a list, use 'ParseList'. Otherwise the number of items is "
+                            "ambiguous and cannot be handled.")
+        elif get_origin(parse_fn) is list:
+            ...
+        else:
+            s = signature(parse_fn)
+            params = OrderedDict()
+            for param in s.parameters.values():
+                # special handling of ParseList
+                if type(param.default) is ParseList:
+                    # check if definition is valid
+                    assert get_origin(param.annotation) is list
+                    assert len(get_args(param.annotation)) == 1
+                    list_type = get_args(param.annotation)[0]
+                    list_length = None
+
+                    if param.default.fixed_length is not None:
+                        list_length = param.default.fixed_length
+                    elif param.default.length_parameter is not None:
+                        list_length = params[param.default.length_parameter]
+                    elif param.default.length_callable is not None:
+                        list_length = param.default.length_callable()
+
+                    params[param.name] = self.parse_n(list_type, n=list_length)
+                else:
+                    params[param.name] = self.parse(param.annotation)
+
+            return parse_fn(*params.values())
+
+    def parse_n(self, parse_fn, n):
+        return [self.parse(parse_fn) for _ in range(n)]
+
+    @classmethod
+    def from_string(cls, string, separator):
+        tree = TreeParser(string).split('\n').split(separator)
+        return cls(tree)
+
+    @classmethod
+    def from_file(cls, file, separator):
+        tree = TreeParser.from_file(file).split(separator)
+        return cls(tree)
+
+
+# def parse_with_type_hints(fn):
+#     def parse_wrapper(*args):
+#         # TODO support lists
+#         hints = [p.annotation for p in signature(fn).parameters.values()]
+#         parsed = [h(v) for h, v in zip(hints, args)]
+#         return fn(*parsed)
+#
+#     return parse_wrapper
+
+
+class ParseList:
+    def __init__(self, fixed_length=None, length_parameter=None, length_callable=None):
+        # check that exactly one of the params is not None
+        assert sum(0 if v is None else 1 for v in
+                   (fixed_length, length_parameter, length_callable)) == 1
+
+        self.fixed_length = fixed_length
+        self.length_parameter = length_parameter
+        self.length_callable = length_callable
 
 
 if __name__ == '__main__':
-    text = "Good evening is this available\n" \
-           "Yes it is\n" \
-           "Please leave me alone\n" \
-           "we are sleeping\n" \
-           "No more contacting please\n" \
-           "Thanks appreciate\n" \
-           "You contacted me\n" \
-           "I know i no longer interested\n" \
-           "Please stop contacting me now\n" \
-           "I will contact attorney general\n" \
-           "If you do not stop\n" \
-           "Thsnks"
+    class Counts(NamedTuple):
+        num_providers: int
+        num_services: int
+        num_countries: int
+        num_projects: int
 
-    p = (TreeParser(text)
-         .split('\n')
-         .split(' ')
-         .aggregate(lambda a, b: a + '_' + b)
-         .aggregate(lambda a, b: a + ' -> \n' + b))
-    result = p.get()
-    print(result)
 
-    with open('testdata/huge.txt', 'r') as file:
-        p = (TreeParser.from_file(file)
-             .map(lambda line: line.strip())
-             .split(' ')
-             .reduce('_'.join))
+    class Region(NamedTuple):
+        name: int
+        num_packages: int
+        price_per_package: float
+        package_serving_units: List[int] = ParseList(length_parameter='num_packages')
 
-        for i, leaf in enumerate(p.leaves()):
-            if i % 10000 == 0:
-                print(i, "|", leaf)
+
+    class Provider(NamedTuple):
+        name: str
+        num_regions: int
+        regions: List[Region] = ParseList(length_parameter='num_regions')
+
+
+    tree = TreeParser()
+    parser = LinearParser(tree)
+    counts = parser.parse(Counts)
+    service_names = parser.parse(list)
+    country_names = parser.parse(list)
