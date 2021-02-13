@@ -1,6 +1,5 @@
-from typing import Any, Iterable, Callable, Generator, NamedTuple, List, get_args, get_origin
-from typing import get_type_hints
-from inspect import signature, Parameter
+from typing import Any, Iterable, Callable, Generator, get_args, get_origin
+from inspect import signature
 from collections import OrderedDict
 
 
@@ -14,23 +13,6 @@ class Node:
         if self.is_leaf:
             raise Exception("Can't iterate over a leaf.")
         return self.value[item]
-
-    # def leaves(self) -> Generator:
-    #     if self.is_leaf:
-    #         yield self
-    #     else:
-    #         for node in self:
-    #             yield from node.leaves()
-
-    # def lowest_nodes(self) -> Generator:
-    #     if self.is_leaf:
-    #         raise Exception("Tree only consists of one node.")
-    #     else:
-    #         if self[0].is_leaf:  # this assumes that the tree is structurally homogeneous
-    #             yield self
-    #         else:
-    #             for tree in self:
-    #                 yield from tree.lowest_nodes()
 
 
 def _expand_op(leaves, func):
@@ -63,7 +45,8 @@ def _aggregate_op(leaves, func, init, init_factory):
     cur_aggregate = None
 
     if init_factory is None:
-        init_factory = lambda: init
+        def init_factory():
+            return init
 
     for leaf in leaves:
         if leaf.parent is not cur_parent:
@@ -185,41 +168,17 @@ class TreeParser:
         return cls(*line_generator())
 
 
-def get_num_args(fn, list_lengths):
-    num = 0
-    length_idx = 0
-
-    for p in signature(fn).parameters.values():
-        if p.kind in (Parameter.KEYWORD_ONLY, Parameter.VAR_KEYWORD):
-            raise Exception("Can't handle keyword-only parameters.")
-        elif p.kind is Parameter.VAR_POSITIONAL:
-            raise Exception("Can't handle variable number of positional parameters.")
-
-        if p.annotation is List:
-            num += list_lengths[length_idx]
-            length_idx += 1
-        else:
-            num += 1
-
-    if length_idx < len(list_lengths):
-        raise Exception("Number of items in 'list_lengths' does not match number of List-annotated "
-                        "parameters in 'fn'.")
-
-    return num
-
-
 class LinearParser:
     def __init__(self, tree: TreeParser):
         self.tree = tree
-        self.num_items_since_last_node = -1
+        self.next_item_is_new_node = True
         self.items_iterator = iter(self._get_items_iterator())
 
     def _get_items_iterator(self):
         for line in self.tree.lowest_inner_nodes():
-            self.num_items_since_last_node = 0
-            for item in line:
+            for i, item in enumerate(line):
+                self.next_item_is_new_node = i == len(line) - 1
                 yield item
-                self.num_items_since_last_node += 1
 
     def _get_one(self):
         return next(self.items_iterator)
@@ -228,7 +187,15 @@ class LinearParser:
         return [self._get_one() for _ in range(n)]
 
     def assert_linebreak(self):
-        assert self.num_items_since_last_node == 0
+        if not self.next_item_is_new_node:
+            raise AssertionError(f"Next item '{self._get_one()}' was still on the same line.")
+
+    def assert_finished(self):
+        try:
+            raise AssertionError(f"Parsing not finished. Next item would have been "
+                                 f"'{self._get_one()}'.")
+        except StopIteration:
+            pass
 
     def parse(self, parse_fn):
         if parse_fn in (str, int, float):
@@ -267,24 +234,20 @@ class LinearParser:
         return [self.parse(parse_fn) for _ in range(n)]
 
     @classmethod
-    def from_string(cls, string, separator):
-        tree = TreeParser(string).split('\n').split(separator)
+    def from_string(cls, string, line_sep='\n', item_sep=' '):
+        tree = (TreeParser(string)
+                .split(line_sep)
+                .map(lambda line: line.strip())
+                .split(item_sep))
         return cls(tree)
 
     @classmethod
-    def from_file(cls, file, separator):
-        tree = TreeParser.from_file(file).split(separator)
+    def from_file(cls, file, separator=' '):
+        tree = (TreeParser
+                .from_file(file)
+                .map(lambda line: line.strip())
+                .split(separator))
         return cls(tree)
-
-
-# def parse_with_type_hints(fn):
-#     def parse_wrapper(*args):
-#         # TODO support lists
-#         hints = [p.annotation for p in signature(fn).parameters.values()]
-#         parsed = [h(v) for h, v in zip(hints, args)]
-#         return fn(*parsed)
-#
-#     return parse_wrapper
 
 
 class ParseList:
@@ -296,31 +259,3 @@ class ParseList:
         self.fixed_length = fixed_length
         self.length_parameter = length_parameter
         self.length_callable = length_callable
-
-
-if __name__ == '__main__':
-    class Counts(NamedTuple):
-        num_providers: int
-        num_services: int
-        num_countries: int
-        num_projects: int
-
-
-    class Region(NamedTuple):
-        name: int
-        num_packages: int
-        price_per_package: float
-        package_serving_units: List[int] = ParseList(length_parameter='num_packages')
-
-
-    class Provider(NamedTuple):
-        name: str
-        num_regions: int
-        regions: List[Region] = ParseList(length_parameter='num_regions')
-
-
-    tree = TreeParser()
-    parser = LinearParser(tree)
-    counts = parser.parse(Counts)
-    service_names = parser.parse(list)
-    country_names = parser.parse(list)
