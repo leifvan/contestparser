@@ -1,0 +1,4 @@
+build/
+dist/
+contestparser/testdata
+contestparser.egg-info
